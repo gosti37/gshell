@@ -1,1 +1,1 @@
-say Hello, World!
+echo Hello, World!

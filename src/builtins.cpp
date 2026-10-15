@@ -1,12 +1,13 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <system_error>
 #include <vector>
 #include <filesystem>
 #include <fstream>
-#include "builtins.hxx"
-#include "env.hxx"
+#include "builtins.hpp"
+#include "env.hpp"
 #include "tfmt.hpp"
 
 using namespace std;
@@ -59,34 +60,34 @@ int say(vector<string>& input)
                         switch (input.at(i).at(c + 1))
                         {
                             case ('n'):
-                            tfmt::print("\n");
+                            tfmt::print(stdout,"\n");
                             c++;
                             break;
                             case ('t'):
-                            tfmt::print("\t");
+                            tfmt::print(stdout,"\t");
                             c++;
                             break;
                             case ('a'):
-                            tfmt::print("\a");
+                            tfmt::print(stdout,"\a");
                             c++;
                             break;
                             case ('b'):
-                            tfmt::print("\b");
+                            tfmt::print(stdout,"\b");
                             c++;
                             break;
                             case ('r'):
-                            tfmt::print("\r");
+                            tfmt::print(stdout,"\r");
                             c++;
                             break;
                             case ('\\'):
-                            tfmt::print("\\");
+                            tfmt::print(stdout,"\\");
                             c++;
                             break;
                         }
                     }
                     else
                     {
-                        tfmt::print("{}", input.at(i).at(c));
+                        tfmt::print(stdout,"{}", input.at(i).at(c));
                     }
                 }
             }
@@ -95,21 +96,21 @@ int say(vector<string>& input)
             {
                 for (size_t c = 0; c < input.at(i).size(); c++)
                 {
-                    tfmt::print("{}", input.at(i).at(c));
+                    tfmt::print(stdout,"{}", input.at(i).at(c));
                 }
             }
 
             else
             {
-                tfmt::print("{}", input.at(i));
-                if (i + 1 < input.size()) tfmt::print(" ");
+                tfmt::print(stdout,"{}", input.at(i));
+                if (i + 1 < input.size()) tfmt::print(stdout," ");
             }
         }
     }
 
     if (!flag_n)
     {
-        tfmt::print("\n");
+        tfmt::print(stdout,"\n");
     }
 
     return 0;
@@ -126,7 +127,7 @@ int sad(void)
         return 1;
     }
 
-    tfmt::print("{}\n", path.string());
+    tfmt::print(stdout,"{}\n", path.string());
     return 0;
 }
 
@@ -173,7 +174,7 @@ int look(vector<string>& input)
         tfmt::print(stdout, "{}", text);
     }
 
-    tfmt::print("\n");
+    tfmt::print(stdout,"\n");
 
     return 0;
 }
@@ -186,7 +187,52 @@ int set(vector<string>& input)
         return 1;
     }
 
-    environmentVars[input.at(1)] = input.at(2);
+    auto find = environmentVars.find(input.at(1));
 
+    if (find != environmentVars.end())
+    {
+        find->second.varVal = input.at(2);
+    }
+    else
+    {
+        environmentVars[input.at(1)] = {input.at(1), input.at(2), false};
+    }
+
+    return 0;
+}
+
+int enable(vector<string>& input)
+{
+    auto find = environmentVars.find(input.at(1));
+
+    if (find != environmentVars.end())
+    {
+        find->second.is_exported = true;
+        exportedVars.pop_back();
+        std::string new_exp = find->second.varKey + "=" + find->second.varVal;
+        exportedVars.push_back(new_exp.data());
+        exportedVars.push_back(nullptr);
+        return 0;
+    }
+    else
+    {
+        environmentVars[input.at(1)] = {input.at(1), "", true};
+        exportedVars.pop_back();
+        std::string new_exp = find->second.varKey + "=";
+        exportedVars.push_back(new_exp.data());
+        exportedVars.push_back(nullptr);
+        return 0;
+    }
+}
+
+int showenv(void)
+{
+    for (auto const& var : exportedVars)
+    {
+        if (var != nullptr)
+        {
+            tfmt::print("{}\n", var);
+        }
+    }
     return 0;
 }

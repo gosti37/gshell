@@ -11,5 +11,7 @@ int sad(void);
 int sdir(std::vector<std::string>& input);
 int look(std::vector<std::string>& input);
 int set(std::vector<std::string>& input);
+int enable(std::vector<std::string>& input);
+int showenv(void);
 
 #endif //BUILTINS_HXX

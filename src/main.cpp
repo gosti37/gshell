@@ -1,8 +1,8 @@
 #include <fstream>
 #include "linenoise.h"
 #include "tfmt.hpp"
-#include "env.hxx"
-#include "parser.hxx"
+#include "env.hpp"
+#include "parser.hpp"
 
 int main(int argc, char **argv)
 {

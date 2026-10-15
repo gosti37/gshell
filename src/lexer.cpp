@@ -1,4 +1,4 @@
-#include "lexer.hxx"
+#include "lexer.hpp"
 #include <sstream>
 
 using namespace std;

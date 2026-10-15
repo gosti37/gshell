@@ -1,7 +1,7 @@
 #include <sstream>
-#include "env.hxx"
-#include "lexer.hxx"
-#include "exec.hxx"
+#include "env.hpp"
+#include "lexer.hpp"
+#include "exec.hpp"
 
 void parse(std::string& input)
 {
@@ -22,19 +22,20 @@ void parse(std::string& input)
         if (token.kind == TOKEN_WORD) continue;
         if (token.kind == TOKEN_VAR)
         {
-            auto tempAuto = environmentVars.find(token.str);
-            if (tempAuto != environmentVars.end())
+            auto find = environmentVars.find(token.str);
+            if (find != environmentVars.end())
             {
-                argv.at(i) = tempAuto->second;
+                argv.at(i) = find->second.varVal;
+                continue;
             }
             else
             {
                 argv.at(i) = " ";
             }
+        }
 
             continue;
         }
-    }
 
     execute(argv);
     return;
