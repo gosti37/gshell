@@ -49,6 +49,7 @@ int main(int argc, char **argv)
             std::free(input_raw);
 
             if (input_raw == nullptr || input == "exit") break;
+            if (input.empty()) continue;
 
             parse(input);
         }
