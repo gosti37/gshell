@@ -1,11 +1,18 @@
+#include <csignal>
 #include <fstream>
-#include "linenoise.h"
+#include "editline.h"
 #include "tfmt.hpp"
 #include "env.hpp"
 #include "parser.hpp"
 
 int main(int argc, char **argv)
 {
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+
     envInit();
 
     if (argc > 1)
@@ -36,15 +43,12 @@ int main(int argc, char **argv)
     {
         while (1)
         {
-            char *input_raw = linenoise("GShell > ");
-
-            if (!input_raw || static_cast<std::string>(input_raw) == "quit") break;
+            char *input_raw = readline("GShell >");
 
             std::string input(input_raw);
+            std::free(input_raw);
 
-            if (input.empty()) continue;
-
-            linenoiseFree(input_raw);
+            if (input_raw == nullptr || input == "exit") break;
 
             parse(input);
         }

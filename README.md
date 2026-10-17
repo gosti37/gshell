@@ -17,14 +17,14 @@ Good-Shell _(GShell)_ is a shell written in C++17 that you can use to do basic s
 * ```enable``` -> enables a variable so it can be used by a program, if there's no variables with that name, it creates one with no value (usage: "enable VAR_NAME")
 * ```showenv``` -> prints out the current environment variables
 
-GShell can also launch external executables, though interactive CLI tools might not work well, especially CLI text editors like Micro, Nano, Emacs etc. (Refer to [TODO](./TODO) for planned future changes)
+GShell can also launch external executables, but it currently lacks better scripting abilities and pipes/redirections. (Refer to [TODO](./TODO) for planned future changes)
 
 ### External Software
 
 This project uses external components:
 
 * [tiny-fmt](https://github.com/monjaris/tiny-fmt) by [monjaris](https://github.com/monjaris)
-* [linenoise](https://github.com/antirez/linenoise) by [antirez](https://github.com/antirez)
+* [editline](https://github.com/troglobit/editline) by [troglobit](https://github.com/troglobit)
 
 ### Build Requirements
 

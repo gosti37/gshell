@@ -2,5 +2,4 @@
 build/
 buffers/
 .cache/
-
-
+compile_commands.json

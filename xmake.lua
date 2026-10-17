@@ -3,7 +3,9 @@ set_version("1.0")
 
 set_languages("c11", "gnu11", "cxx17")
 
-add_rules("mode.debug", "mode.release")
+add_rules("mode.debug", "mode.release", "plugin.compile_commands.autoupdate", {
+    outputdir = "."
+})
 
 if is_mode("debug") then
     set_optimize("none")
@@ -21,15 +23,19 @@ target("tiny-fmt")
     add_includedirs("external/tiny-fmt/include", {public = true})
 target_end()
 
-target("linenoise")
+target("editline")
     set_kind("static")
-    add_files("external/linenoise/src/**.c")
-    add_includedirs("external/linenoise/include", {public = true})
+    add_files(
+        "external/editline/src/complete.c",
+        "external/editline/src/editline.c",
+        "external/editline/src/sysunix.c"
+    )
+    add_includedirs("external/editline/include", "external/editline/src", "external/editline", {public = true})
 target_end()
 
 target("gshell")
     set_kind("binary")
     add_files("src/**.cpp")
     add_includedirs("include", "external/pscxx")
-    add_deps("tiny-fmt", "linenoise")
+    add_deps("tiny-fmt", "editline")
 target_end()

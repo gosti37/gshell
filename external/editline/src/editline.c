@@ -1,0 +1,2298 @@
+/* 
+ * Copyright (c) 1992, 1993  Simmule Turner and Rich Salz
+ * All rights reserved.
+ *
+ * This software is not subject to any license of the American Telephone
+ * and Telegraph Company or of the Regents of the University of California.
+ *
+ * Permission is granted to anyone to use this software for any purpose on
+ * any computer system, and to alter it and redistribute it freely, subject
+ * to the following restrictions:
+ * 1. The authors are not responsible for the consequences of use of this
+ *    software, no matter how awful, even if they arise from flaws in it.
+ * 2. The origin of this software must not be misrepresented, either by
+ *    explicit claim or by omission.  Since few users ever read sources,
+ *    credits must appear in the documentation.
+ * 3. Altered versions must be plainly marked as such, and must not be
+ *    misrepresented as being the original software.  Since few users
+ *    ever read sources, credits must appear in the documentation.
+ * 4. This notice may not be removed or altered.
+ */
+
+#include <errno.h>
+#include <ctype.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+
+#include "editline.h"
+
+/*
+**  Manifest constants.
+*/
+#define SCREEN_COLS     80
+#define SCREEN_ROWS     24
+#define EL_STDIN        0
+#define EL_STDOUT       1
+#define NO_ARG          (-1)
+#define DEL             127
+#define SEPS "\"#$&'()*:;<=>?[\\]^`{|}~\n\t "
+
+/*
+**  The type of case-changing to perform.
+*/
+typedef enum {
+    TOupper, TOlower, TOcapitalize
+} el_case_t;
+
+/*
+**  Key to command mapping.
+*/
+typedef struct {
+    int         Key;
+    el_status_t (*Function)(void);
+} el_keymap_t;
+
+/*
+**  Command history structure.
+*/
+typedef struct {
+    int         Size;
+    int         Cap;		/* allocated Lines slots, HIST_CAP when in sync */
+    int         Pos;
+    char      **Lines;
+} el_hist_t;
+
+/* User definable callbacks. */
+rl_getc_func_t *rl_getc_function = rl_getc;
+rl_hook_func_t *rl_event_hook;
+rl_vintfunc_t  *rl_prep_term_function   = rl_prep_terminal;
+rl_voidfunc_t  *rl_deprep_term_function = rl_deprep_terminal;
+
+/*
+**  Globals.
+*/
+int               rl_eof;
+int               rl_erase;
+int               rl_intr;
+int               rl_kill;
+int               rl_quit;
+#ifdef CONFIG_SIGSTOP
+int               rl_susp;
+#endif
+
+int               el_hist_size = 64;
+static el_hist_t  H = {
+    .Size  = 0,
+    .Cap   = 0,
+    .Pos   = 0,
+    .Lines = NULL,
+};
+
+/* The scrollback holds one more entry than el_hist_size, an editline
+ * tradition; this is the one place that "+ 1" lives. */
+#define HIST_CAP  (el_hist_size + 1)
+
+static char        NILSTR[] = "";
+static const char *el_input = NILSTR;
+static char       *Yanked;
+static char       *Screen;
+static char       NEWLINE[]= CRLF;
+static char       CLEAR[]= "\ec";
+static const char *el_term = "dumb";
+static int        Repeat;
+static int        old_point;
+/* Canonical key a cursor jump declares for reposition(): the Home/End keys
+ * arrive as multi-byte escape sequences, so reposition() only sees the
+ * leading ESC and cannot tell them from any other escape.  beg_line() and
+ * end_line() set this so they are repositioned like Ctrl-A / Ctrl-E. */
+static int        repos_key;
+static int        el_push_back;
+static int        el_pushed;
+static int        el_intr_pending;
+static int        el_infd  = EL_STDIN;
+static int        el_outfd = EL_STDOUT;
+static el_keymap_t Map[];
+static el_keymap_t MetaMap[];
+static size_t     Length = 0;
+static size_t     ScreenCount;
+static size_t     ScreenSize;
+static char       *backspace = "\b";
+static char       *old_search = NULL;
+static int        tty_cols = SCREEN_COLS;
+static int        tty_rows = SCREEN_ROWS;
+static int        Searching = 0;
+static const char *(*search_move)(void);
+static const char *old_prompt = NULL;
+static rl_vcpfunc_t *line_handler = NULL;
+static char       *line_up = "\x1b[A";
+static char       *line_down = "\x1b[B";
+/* Used as a display-column proxy in the wrap math: exact only for a
+ * printable single-width prompt.  A multibyte or escape-bearing prompt
+ * needs a real width (see RL_PROMPT_START/END_IGNORE, issue #48). */
+static int        prompt_len = 0;
+
+int               el_no_echo = 0; /* e.g., under Emacs */
+int               el_no_hist = 0;
+int               rl_point;
+int               rl_mark;
+int               rl_end;
+int               rl_meta_chars = 0; /* Display 8-bit chars as the actual char(0) or as `M-x'(1)? */
+int               rl_inhibit_complete = 0;
+char             *rl_line_buffer = NULL;
+static const char *rl_saved_prompt = NULL;
+const char       *rl_prompt = NULL;
+const char       *rl_readline_name = NULL; /* Set by calling program, for conditional parsing of ~/.inputrc - Not supported yet! */
+FILE             *rl_instream = NULL;  /* The stdio stream from which input is read. Defaults to stdin if NULL */
+FILE             *rl_outstream = NULL; /* The stdio stream to which output is flushed. Defaults to stdout if NULL */
+
+/* Declarations. */
+static char     *editinput(int complete);
+#ifdef CONFIG_USE_TERMCAP
+extern char     *tgetstr(const char *, char **);
+extern int      tgetent(char *, const char *);
+extern int      tgetnum(const char *);
+#endif
+
+/*
+**  Misc. local helper functions.
+*/
+static int is_alpha_num(unsigned char c)
+{
+    if (isalnum(c))
+        return 1;
+    if (ISMETA(c))
+        return 1;
+    if (ISCTL(c))
+        return 1;
+
+    return 0;
+}
+
+/* True for a UTF-8 continuation byte (0x80-0xBF), i.e. a trailing byte of
+ * a multibyte glyph.  Continuation bytes occupy zero display columns and
+ * never start a character, so cursor motion steps over a whole glyph. */
+static int utf8_is_cont(unsigned char c)
+{
+    return (c & 0xC0) == 0x80;
+}
+
+/* Number of glyph starts in rl_line_buffer[begin .. begin + count), i.e. the
+ * character count of a byte range.  Equals count for plain ASCII. */
+static int glyph_count(int begin, int count)
+{
+    int n = 0, k;
+
+    for (k = 0; k < count; k++) {
+        if (!utf8_is_cont(rl_line_buffer[begin + k]))
+            n++;
+    }
+
+    return n;
+}
+
+/* Byte offset of the glyph boundary just after pos: skip the start byte and
+ * any UTF-8 continuation bytes that follow it.  Clamped to rl_end. */
+static int next_glyph(int pos)
+{
+    if (pos < rl_end) {
+        do {
+            pos++;
+        } while (pos < rl_end && utf8_is_cont(rl_line_buffer[pos]));
+    }
+
+    return pos;
+}
+
+/* Display columns occupied by rl_line_buffer[0 .. b): one column per glyph,
+ * like the wrap math's byte==column assumption but corrected for multibyte
+ * (continuation bytes add no column).  Equals b for plain ASCII. */
+static int disp_col(int b)
+{
+    return glyph_count(0, b);
+}
+
+/* Inverse of disp_col(): byte offset of the glyph boundary at display
+ * column col.  Clamped to [0, rl_end]. */
+static int disp_col_to_byte(int col)
+{
+    int b = 0;
+
+    while (b < rl_end && col-- > 0)
+        b = next_glyph(b);
+
+    return b;
+}
+
+/*
+**  TTY input/output functions.
+*/
+
+static void tty_flush(void)
+{
+    ssize_t res;
+
+    if (!ScreenCount)
+        return;
+
+    if (!el_no_echo) {
+        res = write(el_outfd, Screen, ScreenCount);
+        if (res > 0)
+            ScreenCount = 0;
+    }
+}
+
+static void tty_put(const char c)
+{
+    if (el_no_echo)
+        return;
+
+    Screen[ScreenCount] = c;
+    if (++ScreenCount >= ScreenSize) {
+	char *ptr;
+
+        ScreenSize += SCREEN_INC;
+        ptr = realloc(Screen, sizeof(char) * ScreenSize);
+	if (ptr)
+	    Screen = ptr;
+    }
+}
+
+static void tty_puts(const char *p)
+{
+    while (*p)
+        tty_put(*p++);
+}
+
+static void tty_show(unsigned char c)
+{
+    if (c == DEL) {
+        tty_put('^');
+        tty_put('?');
+    } else if (ISCTL(c)) {
+        tty_put('^');
+        tty_put(UNCTL(c));
+    } else if (rl_meta_chars && ISMETA(c)) {
+        tty_put('M');
+        tty_put('-');
+        tty_put(UNMETA(c));
+    } else {
+        tty_put(c);
+    }
+}
+
+static void tty_string(const char *p)
+{
+    int i = disp_col(rl_point) + prompt_len + 1;
+
+    while (*p) {
+        unsigned char c = *p++;
+
+        tty_show(c);
+        if (utf8_is_cont(c))
+            continue;                  /* continuation byte: zero columns */
+        /* The margin glitch forces the terminal's deferred wrap.  A glyph
+         * is echoed one keystroke at a time, so firing it after a multibyte
+         * start byte would split the glyph; let the terminal handle the
+         * wrap natively for those and only glitch on ASCII. */
+        if (i % tty_cols == 0 && c < 0x80) {
+            tty_put(' ');
+            tty_put('\b');
+        }
+        i++;
+    }
+}
+
+static void tty_push(int c)
+{
+    el_pushed = 1;
+    el_push_back = c;
+}
+
+int rl_getc(void)
+{
+    int r;
+    char c;
+
+    do {
+        r = read(el_infd, &c, 1);
+    } while (r == -1 && errno == EINTR);
+
+    return r == 1 ? c : EOF;
+}
+
+static int tty_get(void)
+{
+    tty_flush();
+
+    if (el_pushed) {
+        el_pushed = 0;
+        return el_push_back;
+    }
+
+    if (*el_input)
+        return *el_input++;
+
+    return rl_getc_function();
+}
+
+#define tty_back()  tty_puts(backspace)
+
+static void tty_backn(int n)
+{
+    while (--n >= 0)
+        tty_back();
+}
+
+static void tty_forwardn(int n)
+{
+    char buf[12];
+
+    snprintf(buf, sizeof(buf), "\x1b[%dC", n);
+    tty_puts(buf);
+}
+
+static void tty_info(void)
+{
+    rl_reset_terminal(NULL);
+}
+
+/*
+**  Glue routines to rl_ttyset()
+*/
+void rl_prep_terminal(int meta_flag)
+{
+    rl_meta_chars = !meta_flag;
+    rl_ttyset(0);
+}
+
+void rl_deprep_terminal(void)
+{
+    rl_ttyset(1);
+}
+
+/*
+**  Print an array of words in columns.
+*/
+void el_print_columns(int ac, char **av)
+{
+    char        *p;
+    int         i;
+    int         j;
+    int         k;
+    int         len;
+    int         skip;
+    int         longest;
+    int         cols;
+    int         colwidth;
+
+    /* Find longest name, determine column count from that. */
+    for (longest = 0, i = 0; i < ac; i++) {
+        if ((j = strlen((char *)av[i])) > longest)
+            longest = j;
+    }
+
+    colwidth = longest + 3;
+    if (colwidth > tty_cols)
+        colwidth = tty_cols;
+    cols = tty_cols / colwidth;
+
+    tty_puts(NEWLINE);
+    for (skip = ac / cols + 1, i = 0; i < skip; i++) {
+        for (j = i; j < ac; j += skip) {
+            for (p = av[j], len = strlen((char *)p), k = len; --k >= 0; p++)
+                tty_put(*p);
+
+            if (j + skip < ac) {
+                while (++len < colwidth)
+                    tty_put(' ');
+            }
+        }
+
+        tty_puts(NEWLINE);
+    }
+}
+
+static void reposition(int key)
+{
+    int len_with_prompt = prompt_len + disp_col(rl_end);
+    int n =  len_with_prompt / tty_cols;                  /* determine the number of lines */
+    int i = 0;
+    int col;
+
+    /* A Home/End jump arrives as an escape sequence, so reposition() is
+     * passed the leading ESC; honor the canonical key it declared instead. */
+    if (repos_key) {
+        key = repos_key;
+        repos_key = 0;
+    }
+
+    tty_put('\r');
+
+    if (n > 0) {
+        int line;
+
+	/* determine num of current line */
+        if (key == CTL('A') || key == CTL('E') || key == rl_kill)
+            line = (prompt_len + disp_col(old_point)) / tty_cols;
+        else
+            line = len_with_prompt / tty_cols;
+
+	/* move to end of line(s) */
+        if (key == CTL('E')) {
+	    int k;
+	    /* Row holding the end of the line and that row's column count.  A
+	     * line ending exactly on a row boundary keeps the cursor in that
+	     * row's last column (deferred wrap), not at the start of the next
+	     * row -- otherwise Ctrl-E steps onto a fresh row below and the
+	     * terminal scrolls the whole line up. */
+	    int last_row  = (len_with_prompt - 1) / tty_cols;  /* = n, less one on an exact fit */
+	    int last_cols = len_with_prompt - last_row * tty_cols;
+
+            for (k = line; k < last_row; k++)
+                tty_puts(line_down);
+
+	    /* redraw only that last row, landing the cursor at its end */
+            i = disp_col_to_byte(disp_col(rl_point) - last_cols);
+        } else {
+	    int k;
+
+	    /* CTRL-A, CTRL-U, insert (end, middle), remove (end, middle) */
+            for (k = line; k > 0; k--)
+                tty_puts(line_up); /* redraw characters until changed data */
+
+            tty_puts(rl_prompt);
+        }
+    } else if (n == 0) {
+        tty_puts(rl_prompt);
+    }
+
+    col = disp_col(i) + prompt_len;
+    for (; i < rl_point; i++) {
+        tty_show(rl_line_buffer[i]);
+        /* Look ahead at the next byte, not this one: the wrap newline is
+         * emitted inline with the glyph's bytes, so it must wait until the
+         * whole glyph is written or it would split it.  (tty_string and
+         * ceol guard on the current byte because their boundary action is
+         * a glitch/erase, not a byte of the glyph -- do not unify these.) */
+        if (utf8_is_cont((unsigned char)rl_line_buffer[i + 1]))
+            continue;
+	/* Wrap to the next row only when more characters follow; after the
+	 * final one the cursor stays at the end of this row (deferred wrap),
+	 * so a line ending on a row boundary does not scroll. */
+        if ((++col) % tty_cols == 0 && i + 1 < rl_point)
+            tty_put('\n');
+    }
+}
+
+static void left(el_status_t Change)
+{
+    if (rl_point) {
+        unsigned char c = rl_line_buffer[rl_point - 1];
+
+        /* Continuation bytes are zero-width: emit no cursor movement. */
+        if (!utf8_is_cont(c)) {
+            if ((disp_col(rl_point) + prompt_len) % tty_cols == 0) {
+                tty_puts(line_up);
+                tty_forwardn(tty_cols);
+            } else {
+                tty_back();
+            }
+
+            if (ISMETA(c)) {
+                if (rl_meta_chars) {
+                    tty_back();
+                    tty_back();
+                }
+            } else if (ISCTL(c)) {
+                tty_back();
+            }
+        }
+    }
+
+    if (Change == CSmove)
+        rl_point--;
+}
+
+static void right(el_status_t Change)
+{
+    unsigned char c = rl_line_buffer[rl_point];
+
+    /* A continuation byte is zero-width, so it never triggers a wrap. */
+    if (!utf8_is_cont(c) && (disp_col(rl_point) + prompt_len + 1) % tty_cols == 0)
+        tty_put('\n');
+    else
+        tty_show(c);
+
+    if (Change == CSmove)
+        rl_point++;
+}
+
+/* Step the cursor one whole glyph, skipping trailing UTF-8 continuation
+ * bytes.  Layered on the byte-granular left()/right() so the per-byte
+ * callers (word, case, transpose) keep working unchanged. */
+static void glyph_right(void)
+{
+    int next = next_glyph(rl_point);
+
+    while (rl_point < next)
+        right(CSmove);
+}
+
+static void glyph_left(void)
+{
+    do {
+        left(CSmove);
+    } while (rl_point > 0 && utf8_is_cont(rl_line_buffer[rl_point]));
+}
+
+el_status_t el_ring_bell(void)
+{
+    tty_put('\07');
+    tty_flush();
+
+    return CSstay;
+}
+
+static el_status_t do_macro(int c)
+{
+    char name[4];
+
+    name[0] = '_';
+    name[1] = c;
+    name[2] = '_';
+    name[3] = '\0';
+
+    if ((el_input = (char *)getenv((char *)name)) == NULL) {
+        el_input = NILSTR;
+        return el_ring_bell();
+    }
+
+    return CSstay;
+}
+
+/* Skip forward to start of next word. If @move is set we also move the cursor. */
+static el_status_t do_forward(el_status_t move)
+{
+    int         i;
+    char        *p;
+
+    i = 0;
+    do {
+        p = &rl_line_buffer[rl_point];
+
+        /* Skip leading whitespace, like FSF Readline */
+        for ( ; rl_point < rl_end && (p[0] == ' ' || !is_alpha_num(p[0])); rl_point++, p++) {
+            if (move == CSmove)
+                right(CSstay);
+        }
+
+        /* Skip to end of word, if inside a word. */
+        for (; rl_point < rl_end && is_alpha_num(p[0]); rl_point++, p++) {
+            if (move == CSmove)
+                right(CSstay);
+        }
+
+        if (rl_point == rl_end)
+            break;
+    } while (++i < Repeat);
+
+    return CSstay;
+}
+
+static el_status_t do_case(el_case_t type)
+{
+    int         i;
+    int         end;
+    int         count;
+    char        *p;
+
+    do_forward(CSstay);
+    if (old_point != rl_point) {
+        if ((count = rl_point - old_point) < 0)
+            count = -count;
+
+        rl_point = old_point;
+        if ((end = rl_point + count) > rl_end)
+            end = rl_end;
+
+        for (i = rl_point, p = &rl_line_buffer[i]; rl_point < end; p++) {
+            /* Only fold ASCII; a multibyte glyph's bytes must be left as-is,
+             * else a single-byte locale's toupper/tolower corrupts them. */
+            if ((unsigned char)*p < 0x80) {
+                if ((type == TOupper) || (type == TOcapitalize && rl_point == i)) {
+                    if (islower((unsigned char)(*p)))
+                        *p = toupper((unsigned char)(*p));
+                } else if (isupper((unsigned char)(*p))) {
+                    *p = tolower((unsigned char)(*p));
+                }
+            }
+            right(CSmove);
+        }
+    }
+
+    return CSstay;
+}
+
+static el_status_t case_down_word(void)
+{
+    return do_case(TOlower);
+}
+
+static el_status_t case_up_word(void)
+{
+    return do_case(TOupper);
+}
+
+static el_status_t case_cap_word(void)
+{
+    return do_case(TOcapitalize);
+}
+
+static void ceol(void)
+{
+    int         extras = 0;
+    int         base, col, i;
+    char        *p;
+
+    while (rl_point < 0) {
+        tty_put(' ');
+        rl_point++;
+    }
+
+    base = disp_col(rl_point) + prompt_len;
+    col = base;
+    for (i = rl_point, p = &rl_line_buffer[i]; i <= rl_end; i++, p++) {
+        if (utf8_is_cont((unsigned char)*p))
+            continue;               /* continuation byte: no display column */
+        if ((++col) % tty_cols == 0) {
+            tty_put(' ');
+            tty_put('\n');
+        }
+        else
+            tty_put(' ');
+        if (ISMETA(*p)) {
+            if (rl_meta_chars) {
+                tty_put(' ');
+                tty_put(' ');
+                extras += 2;
+            }
+        } else if (ISCTL(*p)) {
+            tty_put(' ');
+            extras++;
+        }
+    }
+
+    for (col += extras; col > base; col--) {
+        if (col % tty_cols == 0) {
+            tty_puts(line_up);
+            tty_forwardn(tty_cols);
+        } else {
+            tty_back();
+        }
+    }
+}
+
+static void clear_line(void)
+{
+    int n = (disp_col(rl_point) + prompt_len) / tty_cols;
+    rl_point = -(int)strlen(rl_prompt);
+
+    if (n > 0) {
+        for(int k = 0; k < n; k++)
+            tty_puts(line_up);
+        tty_put('\r');
+    }
+    else {
+        tty_put('\r');
+    }
+
+    ceol();
+
+    rl_point = 0;
+    rl_end = 0;
+    rl_line_buffer[0] = '\0';
+}
+
+static el_status_t insert_string(const char *p)
+{
+    size_t      len;
+    int         i;
+    char        *line;
+    char        *q;
+
+    len = strlen(p);
+    if (rl_end + len >= Length) {
+        line = malloc(sizeof(char) * (Length + len + MEM_INC));
+        if (!line)
+            return CSstay;
+
+        if (Length) {
+            memcpy(line, rl_line_buffer, Length);
+            free(rl_line_buffer);
+        }
+
+        rl_line_buffer = line;
+        Length += len + MEM_INC;
+    }
+
+    for (q = &rl_line_buffer[rl_point], i = rl_end - rl_point; --i >= 0; )
+        q[len + i] = q[i];
+
+    memcpy(&rl_line_buffer[rl_point], p, len);
+    rl_end += len;
+    rl_line_buffer[rl_end] = '\0';
+    tty_string(&rl_line_buffer[rl_point]);
+    rl_point += len;
+
+    return rl_point == rl_end ? CSstay : CSmove;
+}
+
+int rl_insert_text(const char *text)
+{
+    int mark = rl_point;
+
+    insert_string(text);
+    ceol();
+
+    return rl_point - mark;
+}
+
+static el_status_t redisplay(int cls)
+{
+    if (cls)
+        tty_puts(CLEAR);
+    else
+        tty_puts("\r\e[K");
+
+    tty_puts(rl_prompt);
+    rl_point = 0;
+    tty_string(rl_line_buffer);
+    rl_point = rl_end;
+    return CSmove;
+}
+
+static el_status_t refresh(void)
+{
+    return redisplay(1);
+}
+
+int rl_refresh_line(int ignore1 __attribute__((unused)), int ignore2 __attribute__((unused)))
+{
+    redisplay(0);
+    return 0;
+}
+
+static el_status_t toggle_meta_mode(void)
+{
+    rl_meta_chars = ! rl_meta_chars;
+    return redisplay(0);
+}
+
+const char *el_next_hist(void)
+{
+    return H.Pos >= H.Size - 1 ? NULL : H.Lines[++H.Pos];
+}
+
+const char *el_prev_hist(void)
+{
+    return H.Pos == 0 ? NULL : H.Lines[--H.Pos];
+}
+
+static el_status_t do_insert_hist(const char *p)
+{
+    if (p == NULL)
+        return el_ring_bell();
+
+    clear_line();
+
+    rl_point = 0;
+    reposition(EOF);
+    rl_end = 0;
+
+    return insert_string(p);
+}
+
+static el_status_t do_hist(const char *(*move)(void))
+{
+    const char *p;
+    int i = 0;
+
+    do {
+        if ((p = move()) == NULL)
+            return el_ring_bell();
+    } while (++i < Repeat);
+
+    return do_insert_hist(p);
+}
+
+static el_status_t h_next(void)
+{
+    if (el_no_hist)
+        return CSstay;
+
+    return do_hist(el_next_hist);
+}
+
+static el_status_t h_prev(void)
+{
+    if (el_no_hist)
+        return CSstay;
+
+    return do_hist(el_prev_hist);
+}
+
+static el_status_t h_first(void)
+{
+    return do_insert_hist(H.Lines[H.Pos = 0]);
+}
+
+static el_status_t h_last(void)
+{
+    return do_insert_hist(H.Lines[H.Pos = H.Size - 1]);
+}
+
+/*
+**  Return zero if pat appears as a substring in text.
+*/
+static int substrcmp(const char *text, const char *pat, size_t len)
+{
+    char c;
+
+    if ((c = *pat) == '\0')
+        return *text == '\0';
+
+    for ( ; *text; text++) {
+        if (*text == c && strncmp(text, pat, len) == 0)
+            return 0;
+    }
+
+    return 1;
+}
+
+static const char *search_hist(const char *search, const char *(*move)(void))
+{
+    int         len;
+    int         pos;
+    int         (*match)(const char *s1, const char *s2, size_t n);
+    const char *pat;
+
+    /* Save or get remembered search pattern. */
+    if (search && *search) {
+        if (old_search)
+            free(old_search);
+        old_search = strdup(search);
+    } else {
+        if (old_search == NULL || *old_search == '\0')
+            return NULL;
+        search = old_search;
+    }
+
+    /* Set up pattern-finder. */
+    if (*search == '^') {
+        match = strncmp;
+        pat = search + 1;
+    } else {
+        match = substrcmp;
+        pat = search;
+    }
+    len = strlen(pat);
+
+    pos = H.Pos;		/* Save H.Pos */
+    while (move()) {
+        if (match(H.Lines[H.Pos], pat, len) == 0)
+            return H.Lines[H.Pos];
+    }
+    H.Pos = pos;		/* Restore H.Pos */
+
+    return NULL;
+}
+
+static el_status_t h_search_end(const char *p)
+{
+    rl_set_prompt(old_prompt);
+    Searching = 0;
+
+    if (el_intr_pending > 0) {
+        el_intr_pending = 0;
+        clear_line();
+        return redisplay(0);
+    }
+
+    p = search_hist(p, search_move);
+    if (p == NULL) {
+        el_ring_bell();
+        clear_line();
+        return redisplay(0);
+    }
+
+    return do_insert_hist(p);
+}
+
+static el_status_t h_search(void)
+{
+    if (Searching)
+        return el_ring_bell();
+    Searching = 1;
+
+    clear_line();
+    old_prompt = rl_prompt;
+    rl_set_prompt("Search: ");
+    reposition(EOF);
+
+    search_move = Repeat == NO_ARG ? el_prev_hist : el_next_hist;
+    if (line_handler) {
+        editinput(0);
+        return CSstay;
+    }
+
+    return h_search_end(editinput(1));
+}
+
+static el_status_t fd_char(void)
+{
+    int i = 0;
+
+    do {
+        if (rl_point >= rl_end)
+            break;
+        glyph_right();
+    } while (++i < Repeat);
+    return CSstay;
+}
+
+static void save_yank(int begin, int i)
+{
+    if (Yanked) {
+        free(Yanked);
+        Yanked = NULL;
+    }
+
+    if (i < 1)
+        return;
+
+    Yanked = malloc(sizeof(char) * (i + 1));
+    if (Yanked) {
+        memcpy(Yanked, &rl_line_buffer[begin], i);
+        Yanked[i] = '\0';
+    }
+}
+
+static el_status_t delete_string(int count)
+{
+    int i;
+    char *p;
+
+    if (count <= 0 || rl_end == rl_point)
+        return el_ring_bell();
+
+    if (count == 1 && rl_point == rl_end - 1) {
+        /* Optimize common case of delete at end of line. */
+        rl_end--;
+        p = &rl_line_buffer[rl_point];
+        i = 1;
+        tty_put(' ');
+        if (ISCTL(*p)) {
+            i = 2;
+            tty_put(' ');
+        } else if (rl_meta_chars && ISMETA(*p)) {
+            i = 3;
+            tty_put(' ');
+            tty_put(' ');
+        }
+        tty_backn(i);
+        *p = '\0';
+        return CSmove;
+    }
+
+    if (rl_point + count > rl_end && (count = rl_end - rl_point) <= 0)
+        return CSstay;
+
+    /* Yank the deletion only when it spans more than one whole glyph. */
+    if (glyph_count(rl_point, count) > 1)
+        save_yank(rl_point, count);
+
+    for (p = &rl_line_buffer[rl_point], i = rl_end - (rl_point + count) + 1; --i >= 0; p++)
+        p[0] = p[count];
+    ceol();
+
+    rl_end -= count;
+    tty_string(&rl_line_buffer[rl_point]);
+
+    return CSmove;
+}
+
+static el_status_t bk_char(void)
+{
+    int i = 0;
+
+    do {
+        if (rl_point == 0)
+            break;
+        glyph_left();
+    } while (++i < Repeat);
+
+    return CSstay;
+}
+
+static el_status_t bk_del_char(void)
+{
+    int start = rl_point, n = 0;
+
+    do {
+        if (rl_point == 0)
+            break;
+        glyph_left();
+    } while (++n < Repeat);
+
+    return delete_string(start - rl_point);
+}
+
+static el_status_t kill_line(void)
+{
+    int i;
+
+    if (Repeat != NO_ARG) {
+        if (Repeat < rl_point) {
+            i = rl_point;
+            rl_point = Repeat;
+            reposition(EOF);
+            delete_string(i - rl_point);
+        } else if (Repeat > rl_point) {
+            right(CSmove);
+            delete_string(Repeat - rl_point - 1);
+        }
+
+        return CSmove;
+    }
+
+    save_yank(rl_point, rl_end - rl_point);
+    rl_line_buffer[rl_point] = '\0';
+    ceol();
+    rl_end = rl_point;
+
+    return CSstay;
+}
+
+static el_status_t insert_char(int c)
+{
+    el_status_t      s;
+    char        buff[2];
+    char        *p;
+    char        *q;
+    int         i;
+
+    if (Repeat == NO_ARG || Repeat < 2) {
+        buff[0] = c;
+        buff[1] = '\0';
+
+        return insert_string(buff);
+    }
+
+    p = malloc(sizeof(char) * (Repeat + 1));
+    if (!p)
+        return CSstay;
+
+    for (i = Repeat, q = p; --i >= 0; )
+        *q++ = c;
+    *q = '\0';
+    Repeat = 0;
+    s = insert_string(p);
+    free(p);
+
+    return s;
+}
+
+static el_status_t beg_line(void)
+{
+    if (rl_point) {
+        rl_point = 0;
+        repos_key = CTL('A');
+        return CSmove;
+    }
+
+    return CSstay;
+}
+
+static el_status_t end_line(void)
+{
+    if (rl_point != rl_end) {
+        rl_point = rl_end;
+        repos_key = CTL('E');
+        return CSmove;
+    }
+
+    return CSstay;
+}
+
+static el_status_t del_char(void)
+{
+    int glyphs = Repeat == NO_ARG ? 1 : Repeat;
+    int pos = rl_point;
+
+    /* Span forward over whole glyphs so a multibyte character deletes as one. */
+    while (glyphs-- > 0 && pos < rl_end)
+        pos = next_glyph(pos);
+
+    return delete_string(pos - rl_point);
+}
+
+el_status_t el_del_char(void)
+{
+    return del_char();
+}
+
+static el_status_t fd_word(void)
+{
+    return do_forward(CSmove);
+}
+
+static el_status_t bk_word(void)
+{
+    int         i;
+    char        *p;
+
+    i = 0;
+    do {
+        for (p = &rl_line_buffer[rl_point]; p > rl_line_buffer && !is_alpha_num(p[-1]); p--)
+            left(CSmove);
+
+        for (; p > rl_line_buffer && !isblank(p[-1]) && is_alpha_num(p[-1]); p--)
+            left(CSmove);
+
+        if (rl_point == 0)
+            break;
+    } while (++i < Repeat);
+
+    return CSstay;
+}
+
+static el_status_t meta(void)
+{
+    int c;
+    el_keymap_t *kp;
+
+    if ((c = tty_get()) == EOF)
+        return CSeof;
+
+#ifdef CONFIG_ANSI_ARROWS
+    /* See: https://en.wikipedia.org/wiki/ANSI_escape_code */
+    /* Recognize ANSI escapes for `Meta+Left` and `Meta+Right`. */
+    if (c == '\e') {
+        switch (tty_get()) {
+        case '[':
+        {
+            switch (tty_get()) {
+            /* \e\e[C = Meta+Left */
+            case 'C': return fd_word();
+            /* \e\e[D = Meta+Right */
+            case 'D': return bk_word();
+            default:
+                break;
+            }
+
+            return el_ring_bell();
+        }
+        default:
+            break;
+        }
+
+        return el_ring_bell();
+    }
+
+    /* Also include VT-100 arrows. */
+    if (c == '[' || c == 'O') {
+        switch (tty_get()) {
+        case EOF:  return CSeof;
+        case '1':
+        {
+            char seq[4] = { 0 };
+            seq[0] = tty_get();
+
+            /* \e[1~ */
+            if (seq[0] == '~')
+                return beg_line(); /* Home */
+
+            for (c = 1; c < 3; c++)
+                seq[c] = tty_get();
+
+            if (!strncmp(seq, ";5C", 3)
+                || !strncmp(seq, ";3C", 3))
+                return fd_word(); /* \e[1;5C = Ctrl+Right */
+            if (!strncmp(seq, ";5D", 3)
+                || !strncmp(seq, ";3D", 3))
+                return bk_word(); /* \e[1;5D = Ctrl+Left */
+
+            break;
+        }
+        case '2':  tty_get(); return CSstay;     /* Insert */
+        case '3':  tty_get(); return del_char(); /* Delete */
+        case '4':  tty_get(); return end_line(); /* End */
+        case '5':  tty_get(); return CSstay;     /* PgUp */
+        case '6':  tty_get(); return CSstay;     /* PgDn */
+        case '7':  tty_get(); return beg_line(); /* Home (urxvt) */
+        case '8':  tty_get(); return end_line(); /* End (urxvt) */
+        case 'A':  return h_prev();              /* Up */
+        case 'B':  return h_next();              /* Down */
+        case 'C':  return fd_char();             /* Left */
+        case 'D':  return bk_char();             /* Right */
+        case 'F':  return end_line();            /* End */
+        case 'H':  return beg_line();            /* Home */
+        default:                                 /* Fall through */
+            break;
+        }
+
+        return el_ring_bell();
+    }
+#endif /* CONFIG_ANSI_ARROWS */
+
+    if (isdigit(c)) {
+        for (Repeat = c - '0'; (c = tty_get()) != EOF && isdigit(c); )
+            Repeat = Repeat * 10 + c - '0';
+        tty_push(c);
+
+        return CSstay;
+    }
+
+    if (isupper(c))
+        return do_macro(c);
+
+    for (kp = MetaMap; kp->Function; kp++) {
+        if (kp->Key == c)
+            return kp->Function();
+    }
+
+    return el_ring_bell();
+}
+
+static el_status_t emacs(int c)
+{
+    el_status_t  s;
+    el_keymap_t *kp;
+
+    /* Save point before interpreting input character 'c'. */
+    old_point = rl_point;
+
+    if (rl_meta_chars && ISMETA(c)) {
+        tty_push(UNMETA(c));
+        return meta();
+    }
+
+    for (kp = Map; kp->Function; kp++) {
+        if (kp->Key == c)
+            break;
+    }
+
+    if (kp->Function) {
+        s = kp->Function();
+        if (s == CSdispatch)	/* If Function is inhibited. */
+            s = insert_char(c);
+    } else {
+        s = insert_char(c);
+    }
+
+    if (!el_pushed) {
+        /* No pushback means no repeat count; hacky, but true. */
+        Repeat = NO_ARG;
+    }
+
+    return s;
+}
+
+static el_status_t tty_special(int c)
+{
+    el_status_t rc;
+
+#ifdef CONFIG_SIGINT
+    if (c == rl_intr) {
+        el_intr_pending = SIGINT;
+        return CSsignal;
+    }
+#endif
+    if (c == rl_quit) {
+        el_intr_pending = SIGQUIT;
+        return CSeof;
+    }
+#ifdef CONFIG_SIGSTOP
+    if (c == rl_susp) {
+        el_intr_pending = SIGTSTP;
+        return CSsignal;
+    }
+#endif
+
+    if (rl_meta_chars && ISMETA(c))
+        return CSdispatch;
+
+    if (c == rl_erase || c == DEL)
+        return bk_del_char();
+
+    if (c == rl_kill) {
+	Repeat = rl_point;
+	rc = bk_del_char();
+	Repeat = NO_ARG;
+	return rc;
+    }
+
+#ifdef CONFIG_EOF
+    if (c == rl_eof && rl_point == 0 && rl_end == 0)
+        return CSeof;
+#endif
+
+    return CSdispatch;
+}
+
+static char *editinput(int complete)
+{
+    int c;
+
+    do {
+        c = tty_get();
+        if (c == EOF)
+            break;
+
+        switch (tty_special(c)) {
+        case CSdone:
+            return rl_line_buffer;
+
+        case CSeof:
+            return NULL;
+
+        case CSsignal:
+            return (char *)"";
+
+        case CSmove:
+            reposition(c);
+            break;
+
+        case CSdispatch:
+            switch (emacs(c)) {
+            case CSdone:
+                return rl_line_buffer;
+
+            case CSeof:
+                return NULL;
+
+            case CSsignal:
+                return (char *)"";
+
+            case CSmove:
+                reposition(c);
+                break;
+
+            case CSdispatch:
+            case CSstay:
+                break;
+            }
+            break;
+
+        case CSstay:
+            break;
+        }
+    } while (complete);
+
+    return NULL;
+}
+
+/* (Re)size the scrollback to hold HIST_CAP entries.  Called before every
+ * add so a change to el_hist_size takes effect and never overflows the
+ * buffer.  Growing keeps all entries; shrinking discards the oldest ones
+ * that no longer fit. */
+/* Evict the oldest history entry, shifting the rest down. */
+static void hist_drop_oldest(void)
+{
+    int i;
+
+    free(H.Lines[0]);
+    for (i = 1; i < H.Size; i++)
+        H.Lines[i - 1] = H.Lines[i];
+    H.Size--;
+}
+
+static void hist_alloc(void)
+{
+    char **lines;
+    int    i;
+
+    if (H.Lines && H.Cap == HIST_CAP)
+        return;
+
+    while (H.Size > HIST_CAP)
+        hist_drop_oldest();
+
+    lines = realloc(H.Lines, HIST_CAP * sizeof(char *));
+    if (!lines)
+        return;			/* keep the existing buffer on failure */
+
+    for (i = H.Size; i < HIST_CAP; i++)
+        lines[i] = NULL;	/* clear unused tail, so free() stays safe */
+
+    H.Lines = lines;
+    H.Cap   = HIST_CAP;
+    if (H.Pos >= H.Size)
+        H.Pos = H.Size > 0 ? H.Size - 1 : 0;
+}
+
+static void hist_add(const char *p)
+{
+    char *s;
+
+    hist_alloc();
+    if (!H.Lines)
+        return;
+
+#ifdef CONFIG_UNIQUE_HISTORY
+    if (H.Size && strcmp(p, H.Lines[H.Size - 1]) == 0)
+        return;
+#endif
+
+    s = strdup(p);
+    if (s == NULL)
+        return;
+
+    if (H.Size == HIST_CAP)		/* full: make room by evicting the oldest */
+        hist_drop_oldest();
+    H.Lines[H.Size++] = s;
+    H.Pos = H.Size - 1;
+}
+
+static char *read_redirected(void)
+{
+    int         size = MEM_INC;
+    char        *p;
+    char        *line;
+    const char  *end;
+
+    p = line = malloc(sizeof(char) * size);
+    if (!p)
+        return NULL;
+
+    end = p + size;
+    while (1) {
+        if (p == end) {
+            int oldpos = end - line;
+
+            size += MEM_INC;
+            p = realloc(line, sizeof(char) * size);
+            if (!p) {
+		free(line);
+                return NULL;
+	    }
+	    line = p;
+            end = p + size;
+
+            p += oldpos;        /* Continue where we left off... */
+        }
+
+        if (read(el_infd, p, 1) <= 0) {
+            /* Ignore "incomplete" lines at EOF, just like we do for a tty. */
+            free(line);
+            return NULL;
+        }
+
+        if (*p == '\n')
+            break;
+        p++;
+    }
+    *p = '\0';
+
+    return line;
+}
+
+/* For compatibility with FSF readline. */
+void rl_reset_terminal(const char *terminal_name)
+{
+#ifdef CONFIG_USE_TERMCAP
+    char                buf[1024];
+    char               *bp;
+#endif
+#ifdef TIOCGWINSZ
+    struct winsize      W;
+#endif
+
+    if (terminal_name) {
+        el_term = terminal_name;
+    } else if ((el_term = getenv("TERM")) == NULL) {
+        el_term = "dumb";
+    }
+
+    /* Initialize to faulty values to trigger fallback if nothing else works. */
+    tty_cols = tty_rows = -1;
+
+#ifdef CONFIG_USE_TERMCAP
+    bp = buf;
+    if (1 == tgetent(buf, el_term)) {
+        char *maybe_backspace = tgetstr("le", &bp);
+        if (maybe_backspace != NULL)
+            backspace = strdup(maybe_backspace);
+        tty_cols = tgetnum("co");
+        tty_rows = tgetnum("li");
+    }
+    /* Make sure to check width & rows and fallback to TIOCGWINSZ if available. */
+#endif
+
+    if (tty_cols <= 0 || tty_rows <= 0) {
+#ifdef TIOCGWINSZ
+        if (ioctl(el_outfd, TIOCGWINSZ, &W) >= 0 && W.ws_col > 0 && W.ws_row > 0) {
+            tty_cols = (int)W.ws_col;
+            tty_rows = (int)W.ws_row;
+            return;
+        }
+#endif
+        tty_cols = SCREEN_COLS;
+        tty_rows = SCREEN_ROWS;
+    }
+}
+
+void rl_set_prompt(const char *prompt)
+{
+    if (prompt)
+        rl_prompt = prompt;
+    prompt_len = strlen(rl_prompt);
+}
+
+void rl_save_prompt(void)
+{
+    rl_saved_prompt = rl_prompt;
+}
+
+void rl_restore_prompt(void)
+{
+    if (rl_saved_prompt)
+        rl_set_prompt(rl_saved_prompt);
+}
+
+void rl_initialize(void)
+{
+    if (!rl_prompt)
+        rl_set_prompt("? ");
+
+    hist_alloc();
+
+    /* Setup I/O descriptors */
+    if (!rl_instream)  el_infd  = EL_STDIN;
+    else               el_infd  = fileno(rl_instream);
+    if (el_infd < 0)   el_infd  = EL_STDIN;
+    if (!rl_outstream) el_outfd = EL_STDOUT;
+    else               el_outfd = fileno(rl_outstream);
+    if (el_outfd < 0)  el_outfd = EL_STDOUT;
+}
+
+void rl_uninitialize(void)
+{
+    int i;
+
+    /* Uninitialize the history */
+    if (H.Lines) {
+        for (i = 0; i < H.Size; i++)
+            free(H.Lines[i]);
+        free(H.Lines);
+        H.Lines = NULL;
+    }
+    H.Size = 0;
+    H.Cap = 0;
+    H.Pos = 0;
+
+    if (old_search)
+        free(old_search);
+    old_search = NULL;
+
+    /* Uninitialize the line buffer */
+    if (rl_line_buffer)
+        free(rl_line_buffer);
+    rl_line_buffer = NULL;
+    Length = 0;
+}
+
+void rl_clear_message(void)
+{
+    /* Nothing to do atm. */
+}
+
+void rl_forced_update_display(void)
+{
+    redisplay(0);
+    tty_flush();
+}
+
+static int el_prep(const char *prompt)
+{
+    rl_initialize();
+
+    if (!rl_line_buffer) {
+        Length = MEM_INC;
+        rl_line_buffer = malloc(sizeof(char) * Length);
+        if (!rl_line_buffer)
+            return -1;
+    }
+
+    tty_info();
+    rl_prep_term_function(!rl_meta_chars);
+    hist_add(NILSTR);
+    ScreenSize = SCREEN_INC;
+    Screen = malloc(sizeof(char) * ScreenSize);
+    if (!Screen)
+        return -1;
+
+    rl_set_prompt(prompt);
+
+    if (el_no_echo) {
+        int old = el_no_echo;
+
+        el_no_echo = 0;
+        tty_puts(rl_prompt);
+        tty_flush();
+        el_no_echo = old;
+    } else {
+        tty_puts(rl_prompt);
+    }
+
+    Repeat = NO_ARG;
+    old_point = rl_point = rl_mark = rl_end = 0;
+    rl_line_buffer[0] = '\0';
+    el_intr_pending = -1;
+
+    return 0;
+}
+
+static char *el_deprep(char *line)
+{
+    if (line) {
+        line = strdup(line);
+        tty_puts(NEWLINE);
+        tty_flush();
+    }
+
+    rl_deprep_term_function();
+    if (Screen) {
+        free(Screen);
+        Screen = NULL;
+    }
+
+    free(H.Lines[--H.Size]);
+    H.Lines[H.Size] = NULL;
+
+    /* Add to history, unless no-echo or no-history mode ... */
+    if (!el_no_echo && !el_no_hist) {
+        if (line != NULL && *line != '\0')
+            hist_add(line);
+    }
+
+    if (el_intr_pending > 0) {
+        int signo = el_intr_pending;
+
+        el_intr_pending = 0;
+        kill(getpid(), signo);
+    }
+
+    return line;
+}
+
+void rl_callback_handler_install(const char *prompt, rl_vcpfunc_t *lhandler)
+{
+    if (!lhandler)
+        return;
+    line_handler = lhandler;
+
+    /*
+     * Any error from el_prep() is handled by the lhandler callbck as
+     * soon as the user calls rl_callback_read_char().
+     */
+    el_prep(prompt);
+    tty_flush();
+}
+
+/*
+ * Reads one character at a time, when a complete line has been received
+ * the lhandler from rl_callback_handler_install() is called with the
+ * line as argument.
+ *
+ * If the callback returns the terminal is prepped for reading a new
+ * line.
+ *
+ * If any error occurs, either in the _install() phase, or while reading
+ * one character, this function restores the terminal and calls lhandler
+ * with a NULL argument.
+ */
+void rl_callback_read_char(void)
+{
+    char *line;
+
+    if (!line_handler) {
+        errno = EINVAL;
+        return;
+    }
+
+    /*
+     * Check if rl_callback_handler_install() failed
+     * This is the only point where we can tell user
+     */
+    if (!Screen || !rl_line_buffer) {
+        errno = ENOMEM;
+        line_handler(el_deprep(NULL));
+        return;
+    }
+
+    line = editinput(0);
+    if (line) {
+        char *l;
+
+        if (Searching) {
+            h_search_end(line);
+            tty_flush();
+            return;
+        }
+
+        l = el_deprep(line);
+        line_handler(l);
+
+        if (el_prep(rl_prompt))
+            line_handler(NULL);
+    }
+    tty_flush();
+}
+
+void rl_callback_handler_remove(void)
+{
+    if (!line_handler)
+        return;
+
+    el_deprep(NULL);
+    line_handler = NULL;
+}
+
+char *readline(const char *prompt)
+{
+    /* Unless called by the user already. */
+    rl_initialize();
+
+    if (!isatty(el_infd)) {
+        tty_flush();
+
+        return read_redirected();
+    }
+
+    if (el_prep(prompt))
+        return NULL;
+
+    return el_deprep(editinput(1));
+}
+
+/*
+ * Even though readline() itself adds history automatically, the user
+ * can also add lines.  This is for compatibility with GNU Readline.
+ */
+void add_history(const char *p)
+{
+    if (p == NULL || *p == '\0')
+        return;
+
+    hist_add(p);
+}
+
+
+/* Read one newline-terminated line of any length, growing the buffer as
+ * needed.  Returns an allocated string without the trailing newline, or
+ * NULL at end of file.  A fixed buffer would split long lines (and chop a
+ * byte mid-glyph for multibyte input) across separate history entries. */
+static char *read_line(FILE *fp)
+{
+    size_t len = 0, size = MEM_INC;
+    char *line, *tmp;
+    int c;
+
+    line = malloc(size);
+    if (!line)
+	return NULL;
+
+    while ((c = getc(fp)) != EOF && c != '\n') {
+	if (len + 1 >= size) {
+	    tmp = realloc(line, size + MEM_INC);
+	    if (!tmp) {
+		free(line);
+		return NULL;
+	    }
+	    line = tmp;
+	    size += MEM_INC;
+	}
+	line[len++] = (char)c;
+    }
+
+    if (c == EOF && len == 0) {
+	free(line);
+	return NULL;
+    }
+
+    line[len] = '\0';
+    return line;
+}
+
+int read_history(const char *filename)
+{
+    FILE *fp;
+    char *line;
+
+    hist_alloc();
+
+    fp = fopen(filename, "r");
+    if (!fp)
+	return EOF;
+
+    /* Replace any existing scrollback; freeing avoids leaking it on reload. */
+    while (H.Size > 0)
+	free(H.Lines[--H.Size]);
+
+    /* Read up to capacity; write_history() writes the same, so a full file
+     * round-trips without dropping its most recent entry (issue #78). */
+    while (H.Size < HIST_CAP && (line = read_line(fp)) != NULL) {
+	add_history(line);
+	free(line);
+    }
+
+    return fclose(fp);
+}
+
+int write_history(const char *filename)
+{
+    FILE *fp;
+    int i = 0;
+
+    hist_alloc();
+
+    fp = fopen(filename, "w");
+    if (!fp)
+	return EOF;
+
+    while (i < H.Size) {
+	if (fprintf(fp, "%s\n", H.Lines[i++]) < 0) {
+	    fclose(fp);
+	    return EOF;
+	}
+    }
+
+    return fclose(fp);
+}
+
+/*
+**  Move back to the beginning of the current word and return an
+**  allocated copy of it.
+*/
+char *el_find_word(void)
+{
+    char        *p, *q;
+    char        *word;
+    size_t      len;
+
+    p = &rl_line_buffer[rl_point];
+    while (p > rl_line_buffer) {
+        p--;
+        if (p > rl_line_buffer && p[-1] == '\\') {
+            p--;
+        } else {
+            if (strchr(SEPS, (char) *p) != NULL) {
+                p++;
+                break;
+            }
+        }
+    }
+
+    len = rl_point - (p - rl_line_buffer) + 1;
+    word = malloc(sizeof(char) * len);
+    if (!word)
+        return NULL;
+
+    q = word;
+    while (p < &rl_line_buffer[rl_point]) {
+        if (*p == '\\') {
+            if (++p == &rl_line_buffer[rl_point])
+                break;
+        }
+        *q++ = *p++;
+    }
+    *q = '\0';
+
+    return word;
+}
+
+static el_status_t c_possible(void)
+{
+    char        **av;
+    char        *word;
+    int         ac;
+
+    word = el_find_word();
+    ac = rl_list_possib(word, &av);
+    if (word)
+        free(word);
+    if (ac) {
+        el_print_columns(ac, av);
+        while (--ac >= 0)
+            free(av[ac]);
+        free(av);
+
+        return CSmove;
+    }
+
+    return el_ring_bell();
+}
+
+static el_status_t c_complete(void)
+{
+    char        *p, *q;
+    char        *word, *string;
+    size_t      len;
+    int         unique;
+    el_status_t s = CSdone;
+
+    if (rl_inhibit_complete)
+        return CSdispatch;
+
+    word = el_find_word();
+    p = rl_complete(word, &unique);
+    if (word)
+        free(word);
+    if (p) {
+        len = strlen(p);
+        word = p;
+
+        string = q = malloc(sizeof(char) * (2 * len + 1));
+        if (!string) {
+            free(word);
+            return CSstay;
+        }
+
+        while (*p) {
+            if (!rl_complete_is_custom()
+                && (*p < ' ' || strchr(SEPS, *p) != NULL)
+                && (!unique || p[1] != 0)) {
+                *q++ = '\\';
+            }
+            *q++ = *p++;
+        }
+        *q = '\0';
+        free(word);
+
+        if (len > 0) {
+            s = insert_string(string);
+#ifdef CONFIG_TERMINAL_BELL
+            if (!unique)
+                el_ring_bell();
+#endif
+        }
+        free(string);
+
+        if (len > 0)
+            return s;
+    }
+
+    return c_possible();
+}
+
+static el_status_t accept_line(void)
+{
+    rl_line_buffer[rl_end] = '\0';
+    return CSdone;
+}
+
+static el_status_t transpose(void)
+{
+    char        c;
+
+    if (rl_point) {
+        if (rl_point == rl_end)
+            left(CSmove);
+        c = rl_line_buffer[rl_point - 1];
+        left(CSstay);
+        rl_line_buffer[rl_point - 1] = rl_line_buffer[rl_point];
+        tty_show(rl_line_buffer[rl_point - 1]);
+        rl_line_buffer[rl_point++] = c;
+        tty_show(c);
+    }
+
+    return CSstay;
+}
+
+static el_status_t quote(void)
+{
+    int c;
+
+    return (c = tty_get()) == EOF ? CSeof : insert_char((int)c);
+}
+
+static el_status_t mk_set(void)
+{
+    rl_mark = rl_point;
+    return CSstay;
+}
+
+static el_status_t exchange(void)
+{
+    int c;
+
+    if ((c = tty_get()) != CTL('X'))
+        return c == EOF ? CSeof : el_ring_bell();
+
+    if ((c = rl_mark) <= rl_end) {
+        rl_mark = rl_point;
+        rl_point = c;
+        return CSmove;
+    }
+
+    return CSstay;
+}
+
+static el_status_t yank(void)
+{
+    if (Yanked && *Yanked)
+        return insert_string(Yanked);
+
+    return CSstay;
+}
+
+static el_status_t copy_region(void)
+{
+    if (rl_mark > rl_end)
+        return el_ring_bell();
+
+    if (rl_point > rl_mark)
+        save_yank(rl_mark, rl_point - rl_mark);
+    else
+        save_yank(rl_point, rl_mark - rl_point);
+
+    return CSstay;
+}
+
+static el_status_t move_to_char(void)
+{
+    int i, c;
+    char *p;
+
+    if ((c = tty_get()) == EOF)
+        return CSeof;
+
+    for (i = rl_point + 1, p = &rl_line_buffer[i]; i < rl_end; i++, p++) {
+        if (*p == c) {
+            rl_point = i;
+            return CSmove;
+        }
+    }
+
+    return CSstay;
+}
+
+static el_status_t fd_kill_word(void)
+{
+    int i;
+
+    do_forward(CSstay);
+    if (old_point != rl_point) {
+        i = rl_point - old_point;
+        rl_point = old_point;
+        return delete_string(i);
+    }
+
+    return CSstay;
+}
+
+static el_status_t bk_kill_word(void)
+{
+    bk_word();
+    if (old_point != rl_point)
+        return delete_string(old_point - rl_point);
+
+    return CSstay;
+}
+
+static int argify(char *line, char ***avp)
+{
+    char       *c;
+    char      **p;
+    char      **arg;
+    int         ac;
+    int         i;
+
+    i = MEM_INC;
+    *avp = p = malloc(sizeof(char *) * i);
+    if (!p)
+        return 0;
+
+    for (c = line; isspace((unsigned char)(*c)); c++)
+        continue;
+
+    if (*c == '\n' || *c == '\0')
+        return 0;
+
+    for (ac = 0, p[ac++] = c; *c && *c != '\n'; ) {
+        if (!isspace((unsigned char)(*c))) {
+            c++;
+            continue;
+        }
+
+        *c++ = '\0';
+        if (*c && *c != '\n') {
+            if (ac + 1 == i) {
+                arg = malloc(sizeof(char *) * (i + MEM_INC));
+                if (!arg) {
+                    p[ac] = NULL;
+                    return ac;
+                }
+
+                memcpy(arg, p, i * sizeof(char *));
+                i += MEM_INC;
+                free(p);
+                *avp = p = arg;
+            }
+            p[ac++] = c;
+        }
+    }
+
+    *c = '\0';
+    p[ac] = NULL;
+
+    return ac;
+}
+
+static el_status_t last_argument(void)
+{
+    char      **av = NULL;
+    char       *p;
+    el_status_t s;
+    int         ac;
+
+    if (H.Size == 1 || (p = (char *)H.Lines[H.Size - 2]) == NULL)
+        return el_ring_bell();
+
+    p = strdup(p);
+    if (!p)
+        return CSstay;
+
+    ac = argify(p, &av);
+    if (Repeat != NO_ARG)
+        s = Repeat < ac ? insert_string(av[Repeat]) : el_ring_bell();
+    else
+        s = ac ? insert_string(av[ac - 1]) : CSstay;
+
+    if (av)
+        free(av);
+    free(p);
+
+    return s;
+}
+
+static el_keymap_t Map[64] = {
+    {   CTL('@'),       mk_set          },
+    {   CTL('A'),       beg_line        },
+    {   CTL('B'),       bk_char         },
+    {   CTL('D'),       del_char        },
+    {   CTL('E'),       end_line        },
+    {   CTL('F'),       fd_char         },
+    {   CTL('G'),       el_ring_bell    },
+    {   CTL('H'),       bk_del_char     },
+    {   CTL('I'),       c_complete      },
+    {   CTL('J'),       accept_line     },
+    {   CTL('K'),       kill_line       },
+    {   CTL('L'),       refresh         },
+    {   CTL('M'),       accept_line     },
+    {   CTL('N'),       h_next          },
+    {   CTL('O'),       el_ring_bell    },
+    {   CTL('P'),       h_prev          },
+    {   CTL('Q'),       el_ring_bell    },
+    {   CTL('R'),       h_search        },
+    {   CTL('S'),       el_ring_bell    },
+    {   CTL('T'),       transpose       },
+    {   CTL('U'),       el_ring_bell    },
+    {   CTL('V'),       quote           },
+    {   CTL('W'),       bk_kill_word    },
+    {   CTL('X'),       exchange        },
+    {   CTL('Y'),       yank            },
+    {   CTL('Z'),       el_ring_bell    },
+    {   CTL('['),       meta            },
+    {   CTL(']'),       move_to_char    },
+    {   CTL('^'),       el_ring_bell    },
+    {   CTL('_'),       el_ring_bell    },
+    {   0,              NULL            }
+};
+
+static el_keymap_t   MetaMap[64]= {
+    {   CTL('H'),       bk_kill_word    },
+    {   DEL,            bk_kill_word    },
+    {   ' ',            mk_set          },
+    {   '.',            last_argument   },
+    {   '<',            h_first         },
+    {   '>',            h_last          },
+    {   '?',            c_possible      },
+    {   'b',            bk_word         },
+    {   'c',            case_cap_word   },
+    {   'd',            fd_kill_word    },
+    {   'f',            fd_word         },
+    {   'l',            case_down_word  },
+    {   'm',            toggle_meta_mode },
+    {   'u',            case_up_word    },
+    {   'y',            yank            },
+    {   'w',            copy_region     },
+    {   0,              NULL            }
+};
+
+static size_t find_key_in_map(int key, el_keymap_t map[], size_t mapsz)
+{
+    size_t i;
+
+    for (i = 0; i < mapsz && map[i].Function; i++) {
+        if (map[i].Key == key)
+            return i;
+    }
+
+    if (i < mapsz)
+        return i;
+
+    return mapsz;
+}
+
+static el_status_t el_bind_key_in_map(int key, el_keymap_func_t function, el_keymap_t map[], size_t mapsz)
+{
+    size_t creat, pos = find_key_in_map(key, map, mapsz);
+
+    /* Must check that pos is not the next to last array position,
+     * otherwise we will write out-of-bounds to terminate the list. */
+    if (pos + 1 >= mapsz) {
+        errno = ENOMEM;
+        return CSeof;
+    }
+
+    /* Add at end, create new? */
+    creat = map[pos].Function == NULL;
+
+    /* A new key so have to add it to end */
+    map[pos].Key      = key;
+    map[pos].Function = function;
+
+    /* Terminate list */
+    if (creat) {
+        map[pos + 1].Key      = 0;
+        map[pos + 1].Function = NULL;
+    }
+
+    return CSdone;
+}
+
+el_status_t el_bind_key(int key, el_keymap_func_t function)
+{
+    return el_bind_key_in_map(key, function, Map, NELEMS(Map));
+}
+
+el_status_t el_bind_key_in_metamap(int key, el_keymap_func_t function)
+{
+    return el_bind_key_in_map(key, function, MetaMap, NELEMS(MetaMap));
+}
+
+rl_getc_func_t *rl_set_getc_func(rl_getc_func_t *func)
+{
+    rl_getc_func_t *old = rl_getc_function;
+    rl_getc_function = func;
+    return old;
+}
+
+/**
+ * Local Variables:
+ *  c-file-style: "k&r"
+ *  c-basic-offset: 4
+ * End:
+ */

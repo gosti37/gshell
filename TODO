@@ -1,3 +1,4 @@
--> Integration of Unix job processing mechanisms for process execution
+~~Integration of Unix job processing mechanisms for process execution~~
+-> Command history
 -> Piping and redirection abilities
 -> Better scripting capabilities

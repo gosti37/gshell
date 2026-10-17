@@ -25,7 +25,7 @@ void execute(std::vector<std::string> exec_input)
     {
         std::string exec_path = path + '/' + exec_input.at(0);
 
-        pscxx::PRESULT result = pscxx::execute_pty(exec_input, exec_path, exportedVars.data());
+        pscxx::PRESULT result = pscxx::execute_int(exec_input, exec_path, exportedVars.data());
 
         if (result.exitCode == 2)
         {
