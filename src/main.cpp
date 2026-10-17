@@ -41,18 +41,24 @@ int main(int argc, char **argv)
 
     else
     {
+        constexpr const char* prompt = "GShell> ";
+
         while (1)
         {
-            char *input_raw = readline("GShell >");
+            std::string input;
 
-            std::string input(input_raw);
-            std::free(input_raw);
+            if (char *input_raw = ::readline(prompt); input_raw == nullptr) {
+                tfmt::print("\n");
+                break;
+            }
+            else {
+                input = input_raw;
+                ::free(input_raw);
+            }
 
-            if (input_raw == nullptr || input == "exit") break;
             if (input.empty()) continue;
-
+            if (input == "exit") break;
             parse(input);
         }
     }
-    return 0;
 }
