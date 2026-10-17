@@ -33,4 +33,4 @@ To build with ```xmake```, you must have these software installed on your system
 * C++17 compiler (gcc, clang etc.)
 * Xmake
 
-Then you can build with ```xmake```, or do ```xmake f -m debug``` for a debug build.
+Then you can build with ```bash build.sh```, or ```bash build_debug.sh``` for a debug build.
