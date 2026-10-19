@@ -10,3 +10,4 @@ cd "$EDITLINE"
 
 cd "$ROOT"
 xmake m -f debug
+xmake
