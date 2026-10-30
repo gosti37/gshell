@@ -9,5 +9,5 @@ cd "$EDITLINE"
 ./configure
 
 cd "$ROOT"
-xmake m -f release
+xmake f -m release
 xmake

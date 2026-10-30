@@ -9,5 +9,5 @@ cd "$EDITLINE"
 ./configure
 
 cd "$ROOT"
-xmake m -f debug
+xmake f -m debug
 xmake

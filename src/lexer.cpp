@@ -1,4 +1,5 @@
 #include "lexer.hpp"
+#include <filesystem>
 #include <sstream>
 
 using namespace std;
@@ -23,14 +24,19 @@ Token nextToken(string input)
 
     for (size_t i = 0; i < vecMain.size(); i++)
     {
-      if (vecMain.at(i).at(0) == '$') 
+      if (vecMain.at(i).at(0) == '$')
       {
         auto varStr = vecMain[i].substr(1, vecMain[i].length() - 1);
 
         return (Token){.kind = TOKEN_VAR, .str = varStr};
       }
 
-      else 
+      else if(std::filesystem::exists(vecMain.at(i)))
+      {
+        return (Token){.kind = TOKEN_BIN, .str = vecMain.at(i)};
+      }
+
+      else
       {
         return (Token){.kind = TOKEN_WORD, .str = vecMain[i]};
       }

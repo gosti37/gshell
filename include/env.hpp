@@ -12,6 +12,7 @@ struct Variable
     bool is_exported;
 };
 
+std::string getUserName(void);
 void envInit(void);
 
 extern std::unordered_map<std::string, Variable> environmentVars;

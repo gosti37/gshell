@@ -1,5 +1,7 @@
 #include <csignal>
+#include <filesystem>
 #include <fstream>
+#include <unistd.h>
 #include "editline.h"
 #include "tfmt.hpp"
 #include "env.hpp"
@@ -41,13 +43,17 @@ int main(int argc, char **argv)
 
     else
     {
-        constexpr const char* prompt = "GShell> ";
+        std::string name = getUserName();
+        char hname[HOST_NAME_MAX];
+        gethostname(hname, HOST_NAME_MAX);
+        std::string prompt;
 
         while (1)
         {
+            prompt = name + '@' + hname + "->" + std::string(std::filesystem::current_path().c_str()) + "> ";
             std::string input;
 
-            if (char *input_raw = ::readline(prompt); input_raw == nullptr) {
+            if (char *input_raw = ::readline(prompt.c_str()); input_raw == nullptr) {
                 tfmt::print("\n");
                 break;
             }

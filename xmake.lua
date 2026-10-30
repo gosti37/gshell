@@ -1,5 +1,5 @@
 set_project("GShell")
-set_version("1.0")
+set_version("1.2")
 
 set_languages("c11", "gnu11", "cxx17")
 

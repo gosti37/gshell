@@ -6,8 +6,9 @@
 
 enum tokenKind
 {
-    TOKEN_WORD,
-    TOKEN_VAR
+  TOKEN_WORD,
+  TOKEN_VAR,
+  TOKEN_BIN
 };
 
 struct Token
