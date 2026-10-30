@@ -44,13 +44,24 @@ int main(int argc, char **argv)
     else
     {
         std::string name = getUserName();
+        std::string home = "/home/" + name;
+        std::string path;
         char hname[HOST_NAME_MAX];
         gethostname(hname, HOST_NAME_MAX);
         std::string prompt;
 
         while (1)
         {
-            prompt = name + '@' + hname + "->" + std::string(std::filesystem::current_path().c_str()) + "> ";
+            path = std::string(std::filesystem::current_path().c_str());
+            if (path.find(home) != std::string::npos)
+            {
+                prompt = name + '@' + hname + "->" + '~' + path.substr(home.length(), path.npos) + "> ";
+            }
+            else
+            {
+                prompt = name + '@' + hname + "->" + path + "> ";
+            }
+
             std::string input;
 
             if (char *input_raw = ::readline(prompt.c_str()); input_raw == nullptr) {
